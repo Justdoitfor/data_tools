@@ -192,12 +192,13 @@ class BiddingSpider:
         print(f"共收集到基本信息 {len(results)} 条，开始进一步抓取详情页提取详细信息与完整正文...")
         
         for idx, res in enumerate(results):
+            print(f"  -> 正在抓取详情页 [{idx+1}/{len(results)}]: {res['项目名称'][:20]}...")
             try:
                 det_headers = self.headers.copy()
                 parsed_href = urllib.parse.urlparse(res["招标文件"])
                 det_headers["Host"] = parsed_href.netloc
                 
-                det_r = self.session.get(res["招标文件"], headers=det_headers, timeout=10)
+                det_r = self.session.get(res["招标文件"], headers=det_headers, timeout=5)
                 det_r.encoding = 'utf-8'
                 det_soup = BeautifulSoup(det_r.text, 'html.parser')
                 
