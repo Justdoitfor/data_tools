@@ -15,6 +15,40 @@ class BiddingSpider:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Connection": "keep-alive"
         }
+
+    def _clean_spaces(self, text):
+        return re.sub(r"\s+", " ", text or "").strip()
+
+    def _extract_section(self, text, start_marker, end_markers):
+        if not text or not start_marker:
+            return ""
+        start_idx = text.find(start_marker)
+        if start_idx < 0:
+            return ""
+        end_idx = len(text)
+        for m in end_markers or []:
+            i = text.find(m, start_idx + len(start_marker))
+            if i >= 0 and i < end_idx:
+                end_idx = i
+        return text[start_idx:end_idx]
+
+    def _extract_phones(self, text):
+        if not text:
+            return []
+        matches = re.findall(r"(?:\d{3,4}-\d{7,8}|\d{11}|\d{7,8})", text)
+        seen = set()
+        out = []
+        for m in matches:
+            if m not in seen:
+                seen.add(m)
+                out.append(m)
+        return out
+
+    def _extract_contact_name(self, text):
+        if not text:
+            return ""
+        m = re.search(r"项目联系人[：:\s]*([\u4e00-\u9fa5A-Za-z·•]{2,20})", text)
+        return m.group(1).strip() if m else ""
         
     def _extract_detail(self, text_content):
         """从详情页正文提取联系人和额外信息"""
@@ -33,10 +67,9 @@ class BiddingSpider:
             "计划招标时间": "",
             "招标内容": "" # 新增完整内容
         }
-        
-        # 保存完整的公告正文内容，去掉过多的连续空格
-        clean_text = re.sub(r'\s+', ' ', text_content)
-        detail_info["招标内容"] = clean_text.strip()
+
+        text_content = self._clean_spaces(text_content)
+        detail_info["招标内容"] = text_content
         
         # 中标金额
         am = re.search(r"(?:中标|成交)(?:总)?金额[：:\s]*([0-9.,]+(?:\s*万元|元|万|%))", text_content)
@@ -49,44 +82,48 @@ class BiddingSpider:
         # 招标代理机构
         agent_m = re.search(r"(?:代理机构|采购代理机构)(?:名称)?[：:\s]*([\u4e00-\u9fa5A-Za-z0-9_()（）]+(?:公司|中心|厂|院|局))", text_content)
         if agent_m: detail_info["招标代理机构"] = agent_m.group(1).strip()
-            
-        # 招标人联系人 / 联系方式
-        buyer_contact_m = re.search(r"采购人信息.*?联系方式[：:\s]*([0-9\-\(\)（）]+)", text_content)
-        if buyer_contact_m: detail_info["招标人联系方式"] = buyer_contact_m.group(1).strip()
-            
-        buyer_name_m = re.search(r"采购人信息.*?项目联系人[：:\s]*([^\s电地名0-9]+)", text_content)
-        if buyer_name_m: detail_info["招标人联系人"] = buyer_name_m.group(1).strip()
-            
-        # 代理机构联系人 / 联系方式
-        agent_contact_m = re.search(r"采购代理机构信息.*?联系方式[：:\s]*([0-9\-\(\)（）]+)", text_content)
-        if agent_contact_m: detail_info["招标代理机构联系方式"] = agent_contact_m.group(1).strip()
-            
-        agent_name_m = re.search(r"采购代理机构信息.*?项目联系人[：:\s]*([^\s电地名0-9]+)", text_content)
-        if agent_name_m: detail_info["招标代理机构联系人"] = agent_name_m.group(1).strip()
-            
-        # 中标人联系人 / 联系方式
-        winner_contact_m = re.search(r"(?:中标|成交)人.*?联系方式[：:\s]*([0-9\-\(\)（）]+)", text_content)
-        if winner_contact_m: detail_info["中标人联系方式"] = winner_contact_m.group(1).strip()
-            
-        winner_name_m = re.search(r"(?:中标|成交)人.*?项目联系人[：:\s]*([^\s电地名0-9]+)", text_content)
-        if winner_name_m: detail_info["中标人联系人"] = winner_name_m.group(1).strip()
-            
-        # 如果以上未匹配到指定的代理机构或采购人联系人，尝试匹配通用的"项目联系人"和"项目联系方式"
-        if not detail_info["招标代理机构联系人"] and not detail_info["招标人联系人"]:
-            gen_name_m = re.search(r"项目联系人[：:\s]*([^\s电地名0-9]+)", text_content)
-            if gen_name_m:
-                detail_info["招标代理机构联系人"] = gen_name_m.group(1).strip()
-        
-        if not detail_info["招标代理机构联系方式"] and not detail_info["招标人联系方式"]:
-            gen_contact_m = re.search(r"(?:项目联系方式|联系方式).*?(?:电\s*话|联系方式)[：:\s]*([0-9\-\(\)（）]+)", text_content)
-            if gen_contact_m:
-                detail_info["招标代理机构联系方式"] = gen_contact_m.group(1).strip()
-                
-            # 若上面依然没匹配到，最后找纯粹的 "电 话"
-            if not detail_info["招标代理机构联系方式"]:
-                phone_m = re.search(r"电\s*话[：:\s]*([0-9\-\(\)（）]+)", text_content[text_content.rfind("项目联系方式"):])
-                if phone_m:
-                    detail_info["招标代理机构联系方式"] = phone_m.group(1).strip()
+
+        buyer_sec = self._extract_section(
+            text_content,
+            "采购人信息",
+            ["采购代理机构信息", "采购代理机构", "项目联系方式", "3.项目联系方式", "3. 项目联系方式"],
+        )
+        if buyer_sec:
+            buyer_phones = self._extract_phones(buyer_sec)
+            if buyer_phones:
+                detail_info["招标人联系方式"] = buyer_phones[0]
+            detail_info["招标人联系人"] = self._extract_contact_name(buyer_sec)
+
+        agent_sec = self._extract_section(
+            text_content,
+            "采购代理机构信息",
+            ["项目联系方式", "3.项目联系方式", "3. 项目联系方式"],
+        )
+        if agent_sec:
+            agent_phones = self._extract_phones(agent_sec)
+            if agent_phones:
+                detail_info["招标代理机构联系方式"] = agent_phones[0]
+            detail_info["招标代理机构联系人"] = self._extract_contact_name(agent_sec)
+
+        project_sec = self._extract_section(
+            text_content,
+            "项目联系方式",
+            ["十、", "十.", "附件", "附件：", "招标文件", "公告期限"],
+        )
+        if project_sec:
+            project_name = self._extract_contact_name(project_sec)
+            project_phones = self._extract_phones(project_sec)
+            if project_name and not detail_info["招标代理机构联系人"] and not detail_info["招标人联系人"]:
+                detail_info["招标代理机构联系人"] = project_name
+            if project_phones and not detail_info["招标代理机构联系方式"] and not detail_info["招标人联系方式"]:
+                detail_info["招标代理机构联系方式"] = project_phones[0]
+
+        if detail_info["招标代理机构联系方式"]:
+            detail_info["招标代理机构联系方式"] = re.sub(r"[^\d\-]", "", detail_info["招标代理机构联系方式"])
+        if detail_info["招标人联系方式"]:
+            detail_info["招标人联系方式"] = re.sub(r"[^\d\-]", "", detail_info["招标人联系方式"])
+        if detail_info["中标人联系方式"]:
+            detail_info["中标人联系方式"] = re.sub(r"[^\d\-]", "", detail_info["中标人联系方式"])
 
         # 粗略提取地址
         addr_m = re.search(r"项目地点[：:\s]*([\u4e00-\u9fa5A-Za-z0-9_()（）]+)", text_content)
@@ -199,16 +236,18 @@ class BiddingSpider:
                 det_headers["Host"] = parsed_href.netloc
                 
                 det_r = self.session.get(res["招标文件"], headers=det_headers, timeout=5)
-                det_r.encoding = 'utf-8'
+                det_r.encoding = det_r.apparent_encoding or "utf-8"
                 det_soup = BeautifulSoup(det_r.text, 'html.parser')
                 
                 # 寻找核心正文区域
-                content_div = det_soup.select_one(".vT_detail_content")
+                content_div = det_soup.select_one(".vF_detail_content")
                 if not content_div:
-                    content_div = det_soup.find("body")
+                    content_div = det_soup.select_one(".vT_detail_content")
+                if not content_div:
+                    content_div = det_soup.select_one(".main") or det_soup.find("body")
                     
                 # 替换各种不可见字符为空格
-                text_content = content_div.text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+                text_content = content_div.get_text("\n").replace("\r", "\n").replace("\t", "\n")
                 
                 detail_info = self._extract_detail(text_content)
                 
