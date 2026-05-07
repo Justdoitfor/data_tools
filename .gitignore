@@ -1,4 +1,6 @@
 *.csv
+*.db
+data/
 __pycache__/
 *.pyc
 .env
