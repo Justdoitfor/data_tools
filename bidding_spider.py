@@ -1,23 +1,360 @@
+import argparse
+import csv
+import datetime as dt
+import os
+import random
+import re
+import sqlite3
+import time
+import urllib.parse
+
 import requests
 from bs4 import BeautifulSoup
-import urllib.parse
-import re
-import csv
-import time
-import argparse
-import sys
 
-class BiddingSpider:
-    def __init__(self):
-        self.session = requests.Session()
-        self.headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Connection": "keep-alive"
-        }
 
-    def _clean_spaces(self, text):
-        return re.sub(r"\s+", " ", text or "").strip()
+FIELDS = [
+    "来源",
+    "项目分类",
+    "项目阶段",
+    "项目名称",
+    "发布时间",
+    "招标人",
+    "变更时间",
+    "计划招标时间",
+    "招标人联系人",
+    "招标人联系方式",
+    "招标代理机构",
+    "招标代理机构联系人",
+    "招标代理机构联系方式",
+    "中标人",
+    "中标人联系人",
+    "中标人联系方式",
+    "中标金额（元）",
+    "招标内容",
+    "项目地点",
+    "招标文件",
+]
+
+
+def _clean_spaces(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _date_range(start_date, end_date):
+    cur = start_date
+    while cur <= end_date:
+        yield cur
+        cur = cur + dt.timedelta(days=1)
+
+
+def _parse_date(s):
+    return dt.datetime.strptime(s, "%Y-%m-%d").date()
+
+
+class HttpClient:
+    def __init__(self, session, min_delay, max_delay, timeout, retries, backoff_base):
+        self.session = session
+        self.min_delay = min_delay
+        self.max_delay = max_delay
+        self.timeout = timeout
+        self.retries = retries
+        self.backoff_base = backoff_base
+
+    def _sleep(self):
+        if self.max_delay <= 0:
+            return
+        time.sleep(random.uniform(self.min_delay, self.max_delay))
+
+    def _is_blocked(self, text):
+        if not text:
+            return False
+        return ("频繁访问" in text) or ("您的访问过于频繁" in text) or ("Forwarding error" in text)
+
+    def request(self, method, url, headers=None, params=None, data=None):
+        last_err = None
+        for attempt in range(self.retries + 1):
+            self._sleep()
+            try:
+                r = self.session.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    data=data,
+                    timeout=self.timeout,
+                )
+                r.encoding = r.apparent_encoding or "utf-8"
+                if self._is_blocked(r.text):
+                    wait_s = self.backoff_base * (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait_s)
+                    continue
+                return r
+            except Exception as e:
+                last_err = e
+                wait_s = self.backoff_base * (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(wait_s)
+        raise last_err
+
+
+class SQLiteStore:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self._init()
+
+    def close(self):
+        self.conn.close()
+
+    def _init(self):
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tenders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT,
+                publish_time TEXT,
+                region TEXT,
+                category TEXT,
+                stage TEXT,
+                buyer TEXT,
+                buyer_contact TEXT,
+                buyer_phone TEXT,
+                agent_name TEXT,
+                agent_contact TEXT,
+                agent_phone TEXT,
+                winner_name TEXT,
+                winner_contact TEXT,
+                winner_phone TEXT,
+                amount TEXT,
+                change_time TEXT,
+                plan_time TEXT,
+                content TEXT,
+                detail_fetched INTEGER NOT NULL DEFAULT 0,
+                list_fetched_at TEXT,
+                detail_fetched_at TEXT,
+                UNIQUE(source, url)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                source TEXT PRIMARY KEY,
+                last_date TEXT
+            )
+            """
+        )
+        self.conn.commit()
+
+    def upsert_list(self, source, item):
+        now = dt.datetime.utcnow().isoformat()
+        self.conn.execute(
+            """
+            INSERT INTO tenders (
+                source, url, title, publish_time, region, category, stage, buyer, list_fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, url) DO UPDATE SET
+                title=excluded.title,
+                publish_time=excluded.publish_time,
+                region=excluded.region,
+                category=excluded.category,
+                stage=excluded.stage,
+                buyer=excluded.buyer,
+                list_fetched_at=excluded.list_fetched_at
+            """,
+            (
+                source,
+                item.get("url"),
+                item.get("title"),
+                item.get("publish_time"),
+                item.get("region"),
+                item.get("category"),
+                item.get("stage"),
+                item.get("buyer"),
+                now,
+            ),
+        )
+
+    def update_detail(self, source, url, detail):
+        now = dt.datetime.utcnow().isoformat()
+        self.conn.execute(
+            """
+            UPDATE tenders SET
+                buyer_contact=?,
+                buyer_phone=?,
+                agent_name=?,
+                agent_contact=?,
+                agent_phone=?,
+                winner_name=?,
+                winner_contact=?,
+                winner_phone=?,
+                amount=?,
+                change_time=?,
+                plan_time=?,
+                content=?,
+                detail_fetched=1,
+                detail_fetched_at=?
+            WHERE source=? AND url=?
+            """,
+            (
+                detail.get("buyer_contact"),
+                detail.get("buyer_phone"),
+                detail.get("agent_name"),
+                detail.get("agent_contact"),
+                detail.get("agent_phone"),
+                detail.get("winner_name"),
+                detail.get("winner_contact"),
+                detail.get("winner_phone"),
+                detail.get("amount"),
+                detail.get("change_time"),
+                detail.get("plan_time"),
+                detail.get("content"),
+                now,
+                source,
+                url,
+            ),
+        )
+
+    def commit(self):
+        self.conn.commit()
+
+    def set_checkpoint(self, source, last_date):
+        self.conn.execute(
+            """
+            INSERT INTO checkpoints (source, last_date)
+            VALUES (?, ?)
+            ON CONFLICT(source) DO UPDATE SET last_date=excluded.last_date
+            """,
+            (source, last_date),
+        )
+        self.conn.commit()
+
+    def get_checkpoint(self, source):
+        row = self.conn.execute("SELECT last_date FROM checkpoints WHERE source=?", (source,)).fetchone()
+        return row["last_date"] if row else None
+
+    def iter_need_detail(self, source, limit):
+        rows = self.conn.execute(
+            """
+            SELECT url, title FROM tenders
+            WHERE source=? AND detail_fetched=0
+            ORDER BY publish_time ASC, id ASC
+            LIMIT ?
+            """,
+            (source, limit),
+        ).fetchall()
+        for r in rows:
+            yield dict(r)
+
+    def export_csv(self, output_path, sources=None, start_date=None, end_date=None):
+        wh = []
+        args = []
+        if sources:
+            wh.append("source IN (%s)" % ",".join(["?"] * len(sources)))
+            args.extend(sources)
+        if start_date:
+            wh.append("publish_time >= ?")
+            args.append(start_date)
+        if end_date:
+            wh.append("publish_time <= ?")
+            args.append(end_date + " 23:59:59")
+        where_sql = (" WHERE " + " AND ".join(wh)) if wh else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM tenders
+            {where_sql}
+            ORDER BY publish_time ASC, id ASC
+            """,
+            args,
+        ).fetchall()
+        with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=FIELDS)
+            w.writeheader()
+            for r in rows:
+                w.writerow(
+                    {
+                        "来源": r["source"],
+                        "项目分类": r["category"] or "",
+                        "项目阶段": r["stage"] or "",
+                        "项目名称": r["title"] or "",
+                        "发布时间": r["publish_time"] or "",
+                        "招标人": r["buyer"] or "",
+                        "变更时间": r["change_time"] or "",
+                        "计划招标时间": r["plan_time"] or "",
+                        "招标人联系人": r["buyer_contact"] or "",
+                        "招标人联系方式": r["buyer_phone"] or "",
+                        "招标代理机构": r["agent_name"] or "",
+                        "招标代理机构联系人": r["agent_contact"] or "",
+                        "招标代理机构联系方式": r["agent_phone"] or "",
+                        "中标人": r["winner_name"] or "",
+                        "中标人联系人": r["winner_contact"] or "",
+                        "中标人联系方式": r["winner_phone"] or "",
+                        "中标金额（元）": r["amount"] or "",
+                        "招标内容": r["content"] or "",
+                        "项目地点": r["region"] or "",
+                        "招标文件": r["url"] or "",
+                    }
+                )
+
+
+class CCGPSource:
+    def __init__(self, client):
+        self.client = client
+        self.name = "中国政府采购网"
+        self.category = "政府采购"
+
+    def list_day(self, day, page, keyword):
+        encoded_kw = urllib.parse.quote(keyword) if keyword else "%20"
+        st = day.strftime("%Y:%m:%d")
+        et = day.strftime("%Y:%m:%d")
+        url = (
+            "https://search.ccgp.gov.cn/bxsearch?"
+            f"searchtype=1&page_index={page}&bidSort=0&buyerName=&projectId=&pinMu=&bidType=&dbselect=bidx"
+            f"&kw={encoded_kw}&start_time={urllib.parse.quote(st)}&end_time={urllib.parse.quote(et)}"
+            "&timeType=2&displayZone=&zoneId=&pppStatus=0&agentName="
+        )
+        r = self.client.request("GET", url, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        items = soup.select(".vT-srch-result-list-bid li")
+        out = []
+        for item in items:
+            a = item.select_one("a")
+            title = a.get_text(strip=True) if a else ""
+            href = a.get("href") if a else ""
+            span = item.select_one("span")
+            span_text = span.get_text(" ", strip=True) if span else ""
+            publish_time = ""
+            buyer = ""
+            stage = ""
+            region = ""
+            time_match = re.search(r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})", span_text)
+            if time_match:
+                publish_time = time_match.group(1)
+            buyer_match = re.search(r"采购人：([^|]+)", span_text)
+            if buyer_match:
+                buyer = buyer_match.group(1).strip()
+            strongs = span.find_all("strong") if span else []
+            if strongs:
+                stage = strongs[0].get_text(strip=True)
+            region_match = re.search(rf"{re.escape(stage)}\s*\|\s*([^|]+)\s*\|", span_text) if stage else None
+            if region_match:
+                region = region_match.group(1).strip()
+            if href:
+                out.append(
+                    {
+                        "url": href,
+                        "title": title,
+                        "publish_time": publish_time,
+                        "region": region,
+                        "category": self.category,
+                        "stage": stage,
+                        "buyer": buyer,
+                    }
+                )
+        return out
 
     def _extract_section(self, text, start_marker, end_markers):
         if not text or not start_marker:
@@ -49,251 +386,294 @@ class BiddingSpider:
             return ""
         m = re.search(r"项目联系人[：:\s]*([\u4e00-\u9fa5A-Za-z·•]{2,20})", text)
         return m.group(1).strip() if m else ""
-        
-    def _extract_detail(self, text_content):
-        """从详情页正文提取联系人和额外信息"""
-        detail_info = {
-            "招标人联系人": "",
-            "招标人联系方式": "",
-            "招标代理机构": "",
-            "招标代理机构联系人": "",
-            "招标代理机构联系方式": "",
-            "中标人": "",
-            "中标人联系人": "",
-            "中标人联系方式": "",
-            "中标金额（元）": "",
-            "项目地点": "",
-            "变更时间": "",
-            "计划招标时间": "",
-            "招标内容": "" # 新增完整内容
-        }
 
-        text_content = self._clean_spaces(text_content)
-        detail_info["招标内容"] = text_content
-        
-        # 中标金额
-        am = re.search(r"(?:中标|成交)(?:总)?金额[：:\s]*([0-9.,]+(?:\s*万元|元|万|%))", text_content)
-        if am: detail_info["中标金额（元）"] = am.group(1).strip()
-            
-        # 中标人
-        wm = re.search(r"(?:中标|成交)(?:人|供应商)(?:名称)?[：:\s]*([\u4e00-\u9fa5A-Za-z0-9_()（）]+(?:公司|中心|厂|院))", text_content)
-        if wm: detail_info["中标人"] = wm.group(1).strip()
-            
-        # 招标代理机构
-        agent_m = re.search(r"(?:代理机构|采购代理机构)(?:名称)?[：:\s]*([\u4e00-\u9fa5A-Za-z0-9_()（）]+(?:公司|中心|厂|院|局))", text_content)
-        if agent_m: detail_info["招标代理机构"] = agent_m.group(1).strip()
+    def _extract_body_text(self, html):
+        soup = BeautifulSoup(html, "html.parser")
+        content_div = soup.select_one(".vF_detail_content") or soup.select_one(".vT_detail_content")
+        if not content_div:
+            content_div = soup.select_one(".main") or soup.find("body")
+        raw_text = content_div.get_text("\n") if content_div else soup.get_text("\n")
+        raw_text = raw_text.replace("\r", "\n").replace("\t", "\n")
+        text = _clean_spaces(raw_text)
+        marker = "一、项目编号"
+        idx = text.find(marker)
+        if idx >= 0:
+            text = text[idx:]
+        return text
+
+    def detail(self, url):
+        r = self.client.request("GET", url, headers={"User-Agent": "Mozilla/5.0"})
+        text = self._extract_body_text(r.text)
 
         buyer_sec = self._extract_section(
-            text_content,
+            text,
             "采购人信息",
             ["采购代理机构信息", "采购代理机构", "项目联系方式", "3.项目联系方式", "3. 项目联系方式"],
         )
-        if buyer_sec:
-            buyer_phones = self._extract_phones(buyer_sec)
-            if buyer_phones:
-                detail_info["招标人联系方式"] = buyer_phones[0]
-            detail_info["招标人联系人"] = self._extract_contact_name(buyer_sec)
-
         agent_sec = self._extract_section(
-            text_content,
+            text,
             "采购代理机构信息",
             ["项目联系方式", "3.项目联系方式", "3. 项目联系方式"],
         )
-        if agent_sec:
-            agent_phones = self._extract_phones(agent_sec)
-            if agent_phones:
-                detail_info["招标代理机构联系方式"] = agent_phones[0]
-            detail_info["招标代理机构联系人"] = self._extract_contact_name(agent_sec)
-
         project_sec = self._extract_section(
-            text_content,
+            text,
             "项目联系方式",
             ["十、", "十.", "附件", "附件：", "招标文件", "公告期限"],
         )
-        if project_sec:
-            project_name = self._extract_contact_name(project_sec)
-            project_phones = self._extract_phones(project_sec)
-            if project_name and not detail_info["招标代理机构联系人"] and not detail_info["招标人联系人"]:
-                detail_info["招标代理机构联系人"] = project_name
-            if project_phones and not detail_info["招标代理机构联系方式"] and not detail_info["招标人联系方式"]:
-                detail_info["招标代理机构联系方式"] = project_phones[0]
 
-        if detail_info["招标代理机构联系方式"]:
-            detail_info["招标代理机构联系方式"] = re.sub(r"[^\d\-]", "", detail_info["招标代理机构联系方式"])
-        if detail_info["招标人联系方式"]:
-            detail_info["招标人联系方式"] = re.sub(r"[^\d\-]", "", detail_info["招标人联系方式"])
-        if detail_info["中标人联系方式"]:
-            detail_info["中标人联系方式"] = re.sub(r"[^\d\-]", "", detail_info["中标人联系方式"])
+        buyer_contact = self._extract_contact_name(buyer_sec)
+        buyer_phone = (self._extract_phones(buyer_sec) or [""])[0]
+        agent_contact = self._extract_contact_name(agent_sec)
+        agent_phone = (self._extract_phones(agent_sec) or [""])[0]
 
-        # 粗略提取地址
-        addr_m = re.search(r"项目地点[：:\s]*([\u4e00-\u9fa5A-Za-z0-9_()（）]+)", text_content)
-        if addr_m: detail_info["项目地点"] = addr_m.group(1).strip()
-            
-        # 变更时间/计划招标时间
-        change_time_m = re.search(r"更正日期[：:\s]*(\d{4}年\d{1,2}月\d{1,2}日|\d{4}-\d{1,2}-\d{1,2})", text_content)
-        if change_time_m: detail_info["变更时间"] = change_time_m.group(1).strip()
-            
-        plan_time_m = re.search(r"预计采购时间[：:\s]*(\d{4}年\d{1,2}月|\d{4}-\d{1,2})", text_content)
-        if plan_time_m: detail_info["计划招标时间"] = plan_time_m.group(1).strip()
-            
-        return detail_info
-        
-    def scrape_ccgp(self, keyword, start_time, end_time, max_pages=1):
-        results = []
-        try:
-            self.session.get("https://search.ccgp.gov.cn/", headers=self.headers, timeout=10)
-        except:
-            pass
+        if not agent_contact and not buyer_contact:
+            agent_contact = self._extract_contact_name(project_sec)
+        if not agent_phone and not buyer_phone:
+            agent_phone = (self._extract_phones(project_sec) or [""])[0]
 
-        encoded_kw = urllib.parse.quote(keyword) if keyword else "%20"
-        st = start_time.replace("-", "%3A") if start_time else ""
-        et = end_time.replace("-", "%3A") if end_time else ""
-        time_type = "2" 
-        
-        kw_display = keyword if keyword else "【全部招标(无关键词)】"
-        print(f"正在抓取，关键词：'{kw_display}'，时间：{start_time} 至 {end_time}...")
-        
-        for page in range(1, max_pages + 1):
-            print(f"正在抓取第 {page} 页...")
-            url = f"https://search.ccgp.gov.cn/bxsearch?searchtype=1&page_index={page}&bidSort=0&buyerName=&projectId=&pinMu=&bidType=&dbselect=bidx&kw={encoded_kw}&start_time={st}&end_time={et}&timeType={time_type}&displayZone=&zoneId=&pppStatus=0&agentName="
-            
-            try:
-                r = self.session.get(url, headers=self.headers, timeout=15)
-                r.encoding = 'utf-8'
-                
-                if "频繁访问" in r.text:
-                    print("检测到访问频率限制，暂停10秒...")
-                    time.sleep(10)
-                    r = self.session.get(url, headers=self.headers, timeout=15)
-                    r.encoding = 'utf-8'
-                    
-                soup = BeautifulSoup(r.text, 'html.parser')
-                items = soup.select(".vT-srch-result-list-bid li")
+        if buyer_phone:
+            buyer_phone = re.sub(r"[^\d\-]", "", buyer_phone)
+        if agent_phone:
+            agent_phone = re.sub(r"[^\d\-]", "", agent_phone)
+
+        amount_m = re.search(r"(?:中标|成交)(?:总)?金额[：:\s]*([0-9.,]+(?:\s*万元|元|万|%))", text)
+        amount = amount_m.group(1).strip() if amount_m else ""
+
+        winner_m = re.search(r"(?:中标|成交)(?:人|供应商)(?:名称)?[：:\s]*([\u4e00-\u9fa5A-Za-z0-9_()（）]+(?:公司|中心|厂|院))", text)
+        winner = winner_m.group(1).strip() if winner_m else ""
+
+        change_time_m = re.search(r"更正日期[：:\s]*(\d{4}年\d{1,2}月\d{1,2}日|\d{4}-\d{1,2}-\d{1,2})", text)
+        change_time = change_time_m.group(1).strip() if change_time_m else ""
+
+        plan_time_m = re.search(r"预计采购时间[：:\s]*(\d{4}年\d{1,2}月|\d{4}-\d{1,2})", text)
+        plan_time = plan_time_m.group(1).strip() if plan_time_m else ""
+
+        agent_name_m = re.search(r"(?:代理机构|采购代理机构)(?:名称)?[：:\s]*([\u4e00-\u9fa5A-Za-z0-9_()（）]+(?:公司|中心|厂|院|局))", text)
+        agent_name = agent_name_m.group(1).strip() if agent_name_m else ""
+
+        return {
+            "buyer_contact": buyer_contact,
+            "buyer_phone": buyer_phone,
+            "agent_name": agent_name,
+            "agent_contact": agent_contact,
+            "agent_phone": agent_phone,
+            "winner_name": winner,
+            "winner_contact": "",
+            "winner_phone": "",
+            "amount": amount,
+            "change_time": change_time,
+            "plan_time": plan_time,
+            "content": text,
+        }
+
+
+class GGZYSource:
+    def __init__(self, client):
+        self.client = client
+        self.name = "全国公共资源交易平台"
+
+    def list_day(self, day, page, keyword):
+        url = "http://deal.ggzy.gov.cn/ds/deal/dealList_find.jsp"
+        data = {
+            "TIMEBEGIN_SHOW": day.strftime("%Y-%m-%d"),
+            "TIMEEND_SHOW": day.strftime("%Y-%m-%d"),
+            "TIMEBEGIN": day.strftime("%Y-%m-%d"),
+            "TIMEEND": day.strftime("%Y-%m-%d"),
+            "SOURCE_TYPE": "1",
+            "DEAL_TIME": "02",
+            "DEAL_CLASSIFY": "01",
+            "DEAL_STAGE": "0100",
+            "DEAL_PROVINCE": "0",
+            "DEAL_CITY": "0",
+            "DEAL_PLATFORM": "0",
+            "BID_PLATFORM": "0",
+            "DEAL_TRADE": "0",
+            "PAGENUMBER": str(page),
+            "FINDTXT": keyword or "",
+        }
+        r = self.client.request("POST", url, headers={"User-Agent": "Mozilla/5.0"}, data=data)
+        soup = BeautifulSoup(r.text, "html.parser")
+        out = []
+        for a in soup.select("a"):
+            href = a.get("href") or ""
+            title = a.get_text(" ", strip=True)
+            if not href or not title:
+                continue
+            if "javascript" in href.lower():
+                continue
+            if href.startswith("/"):
+                href = "http://deal.ggzy.gov.cn" + href
+            if "ggzy.gov.cn" not in href:
+                continue
+            out.append(
+                {
+                    "url": href,
+                    "title": title,
+                    "publish_time": day.strftime("%Y-%m-%d") + " 00:00:00",
+                    "region": "",
+                    "category": "",
+                    "stage": "",
+                    "buyer": "",
+                }
+            )
+        return out
+
+    def detail(self, url):
+        r = self.client.request("GET", url, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+        content_div = soup.select_one("article") or soup.select_one(".content") or soup.find("body")
+        raw_text = content_div.get_text("\n") if content_div else soup.get_text("\n")
+        raw_text = raw_text.replace("\r", "\n").replace("\t", "\n")
+        text = _clean_spaces(raw_text)
+        return {
+            "buyer_contact": "",
+            "buyer_phone": "",
+            "agent_name": "",
+            "agent_contact": "",
+            "agent_phone": "",
+            "winner_name": "",
+            "winner_contact": "",
+            "winner_phone": "",
+            "amount": "",
+            "change_time": "",
+            "plan_time": "",
+            "content": text,
+        }
+
+
+class Crawler:
+    def __init__(self, store):
+        self.store = store
+
+    def crawl_list(self, source_obj, start_date, end_date, keyword, max_pages):
+        for day in _date_range(start_date, end_date):
+            for page in range(1, max_pages + 1):
+                items = source_obj.list_day(day, page, keyword)
                 if not items:
-                    print("本页未发现数据或抓取已结束。")
                     break
-                    
-                for item in items:
-                    a = item.select_one("a")
-                    title = a.text.strip() if a else ""
-                    href = a.get("href") if a else ""
-                    
-                    span = item.select_one("span")
-                    span_text = span.text if span else ""
-                    
-                    publish_time, purchaser, notice_type, region, project_type = "", "", "", "", ""
-                    
-                    raw_span = span_text.replace("\n", " ").replace("\r", " ")
-                    time_match = re.search(r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})", raw_span)
-                    publish_time = time_match.group(1) if time_match else ""
-                    
-                    purchaser_match = re.search(r"采购人：([^|]+)", raw_span)
-                    purchaser = purchaser_match.group(1).strip() if purchaser_match else ""
-                    
-                    strongs = span.find_all("strong")
-                    if len(strongs) >= 1: notice_type = strongs[0].text.strip()
-                    if len(strongs) >= 2: project_type = strongs[1].text.strip()
-                        
-                    region_match = re.search(rf"{notice_type}\s*\|\s*([^|]+)\s*\|", raw_span)
-                    if region_match: region = region_match.group(1).strip()
-                        
-                    res_dict = {
-                        "来源": "中国政府采购网",
-                        "项目分类": "政府采购",
-                        "项目阶段": notice_type,
-                        "项目名称": title,
-                        "发布时间": publish_time,
-                        "招标人": purchaser,
-                        "变更时间": "",
-                        "计划招标时间": "",
-                        "招标人联系人": "",
-                        "招标人联系方式": "",
-                        "招标代理机构": "",
-                        "招标代理机构联系人": "",
-                        "招标代理机构联系方式": "",
-                        "中标人": "",
-                        "中标人联系人": "",
-                        "中标人联系方式": "",
-                        "中标金额（元）": "",
-                        "招标内容": "",
-                        "项目地点": region,
-                        "招标文件": href
-                    }
-                    results.append(res_dict)
-                    
-            except Exception as e:
-                print(f"解析第 {page} 页时出错: {e}")
-                
-            time.sleep(2)
-            
-        print(f"共收集到基本信息 {len(results)} 条，开始进一步抓取详情页提取详细信息与完整正文...")
-        
-        for idx, res in enumerate(results):
-            print(f"  -> 正在抓取详情页 [{idx+1}/{len(results)}]: {res['项目名称'][:20]}...")
-            try:
-                det_headers = self.headers.copy()
-                parsed_href = urllib.parse.urlparse(res["招标文件"])
-                det_headers["Host"] = parsed_href.netloc
-                
-                det_r = self.session.get(res["招标文件"], headers=det_headers, timeout=5)
-                det_r.encoding = det_r.apparent_encoding or "utf-8"
-                det_soup = BeautifulSoup(det_r.text, 'html.parser')
-                
-                # 寻找核心正文区域
-                content_div = det_soup.select_one(".vF_detail_content")
-                if not content_div:
-                    content_div = det_soup.select_one(".vT_detail_content")
-                if not content_div:
-                    content_div = det_soup.select_one(".main") or det_soup.find("body")
-                    
-                # 替换各种不可见字符为空格
-                text_content = content_div.get_text("\n").replace("\r", "\n").replace("\t", "\n")
-                
-                detail_info = self._extract_detail(text_content)
-                
-                # Update base dict with detail info
-                for k, v in detail_info.items():
-                    if v and not res.get(k):
-                        res[k] = v
-                        
-            except Exception as e:
-                pass
-            time.sleep(1)
-                
-        return results
+                for it in items:
+                    self.store.upsert_list(source_obj.name, it)
+                self.store.commit()
+            self.store.set_checkpoint(source_obj.name, day.strftime("%Y-%m-%d"))
 
-    def save_to_csv(self, data, filename="bidding_data.csv"):
-        if not data:
-            print("没有可保存的数据。")
-            return
-            
-        keys = [
-            "来源", "项目分类", "项目阶段", "项目名称", "发布时间", 
-            "招标人", "变更时间", "计划招标时间", "招标人联系人", "招标人联系方式", 
-            "招标代理机构", "招标代理机构联系人", "招标代理机构联系方式", 
-            "中标人", "中标人联系人", "中标人联系方式", "中标金额（元）", 
-            "招标内容", "项目地点", "招标文件"
-        ]
-        with open(filename, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
-            writer.writeheader()
-            writer.writerows(data)
-        print(f"成功将 {len(data)} 条数据保存至 {filename}")
+    def crawl_detail(self, source_obj, limit):
+        for i, row in enumerate(self.store.iter_need_detail(source_obj.name, limit), start=1):
+            url = row["url"]
+            title = row.get("title") or ""
+            print(f"  -> 正在抓取详情页 [{i}/{limit}]: {title[:20]}...")
+            try:
+                detail = source_obj.detail(url)
+                self.store.update_detail(source_obj.name, url, detail)
+                self.store.commit()
+            except Exception:
+                continue
+
+
+def _map_source_names(keys):
+    mp = {"ccgp": "中国政府采购网", "ggzy": "全国公共资源交易平台"}
+    return [mp.get(k, k) for k in keys]
+
 
 def main():
-    parser = argparse.ArgumentParser(description="招投标信息自动化采集工具")
-    parser.add_argument("-k", "--keyword", default="", help="搜索关键词，不填则采集全部")
-    parser.add_argument("-p", "--pages", type=int, default=1, help="采集页数，默认：1")
-    parser.add_argument("-s", "--start_time", default="", help="开始时间，格式：YYYY-MM-DD")
-    parser.add_argument("-e", "--end_time", default="", help="结束时间，格式：YYYY-MM-DD")
-    parser.add_argument("-o", "--output", default="bidding_data.csv", help="导出CSV文件名")
-    
+    parser = argparse.ArgumentParser(description="招投标信息自动化采集工具（SQLite落库/断点续跑/多源采集）")
+    sub = parser.add_subparsers(dest="cmd")
+
+    crawl_p = sub.add_parser("crawl", help="采集列表与详情并落库")
+    crawl_p.add_argument("--db", default="data/tenders.db")
+    crawl_p.add_argument("--sources", default="ccgp", help="ccgp,ggzy 或 ccgp,ggzy")
+    crawl_p.add_argument("-k", "--keyword", default="")
+    crawl_p.add_argument("--start-date", required=True)
+    crawl_p.add_argument("--end-date", required=True)
+    crawl_p.add_argument("--max-pages", type=int, default=50)
+    crawl_p.add_argument("--detail", action="store_true")
+    crawl_p.add_argument("--detail-limit", type=int, default=500)
+    crawl_p.add_argument("--min-delay", type=float, default=1.0)
+    crawl_p.add_argument("--max-delay", type=float, default=3.0)
+    crawl_p.add_argument("--timeout", type=float, default=10.0)
+    crawl_p.add_argument("--retries", type=int, default=2)
+    crawl_p.add_argument("--backoff-base", type=float, default=5.0)
+
+    export_p = sub.add_parser("export", help="从SQLite导出CSV")
+    export_p.add_argument("--db", default="data/tenders.db")
+    export_p.add_argument("-o", "--output", default="bidding_data.csv")
+    export_p.add_argument("--sources", default="")
+    export_p.add_argument("--start-date", default="")
+    export_p.add_argument("--end-date", default="")
+
+    legacy_p = sub.add_parser("run", help="兼容旧用法：采集并直接导出CSV")
+    legacy_p.add_argument("--db", default="data/tenders.db")
+    legacy_p.add_argument("--sources", default="ccgp")
+    legacy_p.add_argument("-k", "--keyword", default="")
+    legacy_p.add_argument("-p", "--pages", type=int, default=1)
+    legacy_p.add_argument("-s", "--start_time", default="")
+    legacy_p.add_argument("-e", "--end_time", default="")
+    legacy_p.add_argument("-o", "--output", default="bidding_data.csv")
+    legacy_p.add_argument("--min-delay", type=float, default=1.0)
+    legacy_p.add_argument("--max-delay", type=float, default=3.0)
+    legacy_p.add_argument("--timeout", type=float, default=10.0)
+    legacy_p.add_argument("--retries", type=int, default=2)
+    legacy_p.add_argument("--backoff-base", type=float, default=5.0)
+
     args = parser.parse_args()
-    
-    spider = BiddingSpider()
-    data = spider.scrape_ccgp(args.keyword, args.start_time, args.end_time, args.pages)
-    
-    spider.save_to_csv(data, args.output)
+    if not args.cmd:
+        parser.print_help()
+        return
+
+    if args.cmd == "export":
+        store = SQLiteStore(args.db)
+        src_keys = [s.strip() for s in args.sources.split(",") if s.strip()]
+        store.export_csv(
+            args.output,
+            sources=_map_source_names(src_keys) if src_keys else None,
+            start_date=args.start_date or None,
+            end_date=args.end_date or None,
+        )
+        store.close()
+        print(f"导出完成：{args.output}")
+        return
+
+    session = requests.Session()
+    client = HttpClient(
+        session=session,
+        min_delay=args.min_delay,
+        max_delay=args.max_delay,
+        timeout=args.timeout,
+        retries=args.retries,
+        backoff_base=args.backoff_base,
+    )
+
+    src_map = {"ccgp": CCGPSource(client), "ggzy": GGZYSource(client)}
+    src_keys = [s.strip() for s in args.sources.split(",") if s.strip()]
+    src_objs = [src_map[s] for s in src_keys if s in src_map]
+
+    store = SQLiteStore(args.db)
+    crawler = Crawler(store)
+
+    if args.cmd == "run":
+        if args.start_time and args.end_time:
+            start_date = _parse_date(args.start_time)
+            end_date = _parse_date(args.end_time)
+        else:
+            today = dt.date.today()
+            start_date = today
+            end_date = today
+        for src in src_objs:
+            crawler.crawl_list(src, start_date, end_date, args.keyword, args.pages)
+            crawler.crawl_detail(src, limit=min(200, args.pages * 50))
+        store.export_csv(args.output, sources=_map_source_names(src_keys) if src_keys else None)
+        store.close()
+        print(f"完成：{args.output}")
+        return
+
+    start_date = _parse_date(args.start_date)
+    end_date = _parse_date(args.end_date)
+    for src in src_objs:
+        print(f"开始采集：{src.name} {start_date} -> {end_date}")
+        crawler.crawl_list(src, start_date, end_date, args.keyword, args.max_pages)
+        if args.detail:
+            crawler.crawl_detail(src, args.detail_limit)
+    store.close()
+
 
 if __name__ == "__main__":
     main()
