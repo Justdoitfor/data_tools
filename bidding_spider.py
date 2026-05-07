@@ -85,15 +85,31 @@ class HttpClient:
                 )
                 r.encoding = r.apparent_encoding or "utf-8"
                 if self._is_blocked(r.text):
+                    event_id = ""
+                    m = re.search(r"事件ID[:：]\s*([0-9a-fA-F]+)", r.text)
+                    if m:
+                        event_id = m.group(1)
+                    last_err = BlockedError(url=url, event_id=event_id)
                     wait_s = self.backoff_base * (2 ** attempt) + random.uniform(0, 1)
+                    print(f"触发频率限制，等待 {wait_s:.1f}s 后重试（{attempt+1}/{self.retries+1}）{(' 事件ID:'+event_id) if event_id else ''}", flush=True)
                     time.sleep(wait_s)
                     continue
                 return r
             except Exception as e:
                 last_err = e
                 wait_s = self.backoff_base * (2 ** attempt) + random.uniform(0, 1)
+                print(f"请求失败：{e}，等待 {wait_s:.1f}s 后重试（{attempt+1}/{self.retries+1}）", flush=True)
                 time.sleep(wait_s)
+        if last_err is None:
+            raise RuntimeError("请求失败但未捕获到异常信息")
         raise last_err
+
+
+class BlockedError(Exception):
+    def __init__(self, url, event_id=""):
+        self.url = url
+        self.event_id = event_id
+        super().__init__(f"触发频率限制: {url}{(' 事件ID:'+event_id) if event_id else ''}")
 
 
 class SQLiteStore:
@@ -547,14 +563,27 @@ class Crawler:
 
     def crawl_list(self, source_obj, start_date, end_date, keyword, max_pages):
         for day in _date_range(start_date, end_date):
+            inserted = 0
             for page in range(1, max_pages + 1):
-                items = source_obj.list_day(day, page, keyword)
+                print(f"[{source_obj.name}] 列表采集 {day} 第{page}页", flush=True)
+                try:
+                    items = source_obj.list_day(day, page, keyword)
+                except BlockedError as e:
+                    print(str(e), flush=True)
+                    print("建议：降低 max-pages、增大 min/max-delay，并等待一段时间后重试；已保存已完成日期的 checkpoint，可断点续跑。", flush=True)
+                    return
+                except Exception as e:
+                    print(f"[{source_obj.name}] 列表采集失败：{e}", flush=True)
+                    return
                 if not items:
                     break
                 for it in items:
                     self.store.upsert_list(source_obj.name, it)
+                    inserted += 1
                 self.store.commit()
+                print(f"[{source_obj.name}] 已写入 {inserted} 条（截至 {day} 第{page}页）", flush=True)
             self.store.set_checkpoint(source_obj.name, day.strftime("%Y-%m-%d"))
+            print(f"[{source_obj.name}] 完成日期 {day}，checkpoint 已更新", flush=True)
 
     def crawl_detail(self, source_obj, limit):
         for i, row in enumerate(self.store.iter_need_detail(source_obj.name, limit), start=1):
